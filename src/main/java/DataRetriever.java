@@ -1,4 +1,10 @@
-import java.sql.*;
+import java.sql.Connection;
+import java.sql.PreparedStatement;
+import java.sql.ResultSet;
+import java.sql.SQLException;
+import java.sql.Timestamp;
+import java.sql.Types;
+import java.time.Instant;
 import java.util.ArrayList;
 import java.util.List;
 import java.util.Map;
@@ -10,7 +16,11 @@ public class DataRetriever {
         DBConnection dbConnection = new DBConnection();
         try (Connection connection = dbConnection.getConnection()) {
             PreparedStatement preparedStatement = connection.prepareStatement("""
-                    select id, reference, creation_datetime from "order" where reference like ?""");
+                    select o.id, o.reference, o.creation_datetime, o.installation_datetime, o.departure_datetime,
+                      t.id as table_id, t.number as table_number
+                    from "order" o
+                    left join restaurant_table t on o.id_table = t.id
+                    where o.reference like ?""");
             preparedStatement.setString(1, reference);
             ResultSet resultSet = preparedStatement.executeQuery();
             if (resultSet.next()) {
@@ -19,6 +29,24 @@ public class DataRetriever {
                 order.setId(idOrder);
                 order.setReference(resultSet.getString("reference"));
                 order.setCreationDatetime(resultSet.getTimestamp("creation_datetime").toInstant());
+
+                Timestamp installDate = resultSet.getTimestamp("installation_datetime");
+                if (installDate != null) {
+                    order.setInstallationDate(installDate.toInstant());
+                }
+                Timestamp departDate = resultSet.getTimestamp("departure_datetime");
+                if (departDate != null) {
+                    order.setDepartureDate(departDate.toInstant());
+                }
+
+                int tableId = resultSet.getInt("table_id");
+                if (!resultSet.wasNull()) {
+                   RestaurantTable table = new RestaurantTable();
+                   table.setId(tableId);
+                   table.setNumber(resultSet.getInt("table_number"));
+                   order.setTable(table);
+                }
+
                 order.setDishOrderList(findDishOrderByIdOrder(idOrder));
                 return order;
             }
@@ -320,7 +348,7 @@ public class DataRetriever {
             return;
         }
         String attachSql = """
-                    insert into dish_ingredient (id, id_ingredient, id_dish, required_quantity, unit)
+                    insert into dish_ingredient (id, id_ingredient, id_dish, quantity_required, unit)
                     values (?, ?, ?, ?, ?::unit)
                 """;
 
@@ -344,7 +372,7 @@ public class DataRetriever {
         try {
             PreparedStatement preparedStatement = connection.prepareStatement(
                     """
-                            select ingredient.id, ingredient.name, ingredient.price, ingredient.category, di.required_quantity, di.unit
+                            select ingredient.id, ingredient.name, ingredient.price, ingredient.category, di.quantity_required, di.unit
                             from ingredient join dish_ingredient di on di.id_ingredient = ingredient.id where id_dish = ?;
                             """);
             preparedStatement.setInt(1, idDish);
@@ -358,7 +386,7 @@ public class DataRetriever {
 
                 DishIngredient dishIngredient = new DishIngredient();
                 dishIngredient.setIngredient(ingredient);
-                dishIngredient.setQuantity(resultSet.getObject("required_quantity") == null ? null : resultSet.getDouble("required_quantity"));
+                dishIngredient.setQuantity(resultSet.getObject("quantity_required") == null ? null : resultSet.getDouble("quantity_required"));
                 dishIngredient.setUnit(Unit.valueOf(resultSet.getString("unit")));
 
                 dishIngredients.add(dishIngredient);
@@ -412,13 +440,149 @@ public class DataRetriever {
     }
 
     private void updateSequenceNextValue(Connection conn, String tableName, String columnName, String sequenceName) throws SQLException {
-        String setValSql = String.format(
-                "SELECT setval('%s', (SELECT COALESCE(MAX(%s), 0) FROM %s))",
-                sequenceName, columnName, tableName
-        );
+        String sql = String.format("SELECT COALESCE(MAX(%s), 0) FROM %s", columnName, tableName);
+        int maxId = 0;
+        try (PreparedStatement ps = conn.prepareStatement(sql)) {
+            try (ResultSet rs = ps.executeQuery()) {
+                if (rs.next()) {
+                    maxId = rs.getInt(1);
+                }
+            }
+        }
+
+        String setValSql;
+        if (maxId == 0) {
+            setValSql = String.format("SELECT setval('%s', 1, false)", sequenceName);
+        } else {
+            setValSql = String.format("SELECT setval('%s', %d, true)", sequenceName, maxId);
+        }
 
         try (PreparedStatement ps = conn.prepareStatement(setValSql)) {
             ps.executeQuery();
+        }
+    }
+
+    public Order saveOrder(Order orderToSave) {
+        if (orderToSave.getTable() == null) {
+             throw new RuntimeException("Table is mandatory for an order");
+        }
+        if (orderToSave.getInstallationDate() == null || orderToSave.getDepartureDate() == null) {
+            throw new RuntimeException("Installation and departure dates are mandatory");
+        }
+
+        List<RestaurantTable> availableTables = findAvailableTables(orderToSave.getInstallationDate(), orderToSave.getDepartureDate());
+
+        boolean isSelectedTableAvailable = availableTables.stream()
+            .anyMatch(t -> t.getId().equals(orderToSave.getTable().getId()));
+
+        if (!isSelectedTableAvailable) {
+            String availableMsg = availableTables.isEmpty()
+                ? "aucun table n'est disponible"
+                : "les tables numéro " + availableTables.stream()
+                      .map(t -> t.getNumber().toString())
+                      .collect(Collectors.joining(" et ")) + " sont actuellement libres";
+
+            throw new RuntimeException("La table numéro " + orderToSave.getTable().getNumber() + " n'est pas disponible, " + availableMsg);
+        }
+
+        // Proceed to save
+        String upsertOrderSql = """
+            INSERT INTO "order" (id, reference, creation_datetime, id_table, installation_datetime, departure_datetime)
+            VALUES (?, ?, ?, ?, ?, ?)
+            ON CONFLICT (id) DO UPDATE
+            SET reference = EXCLUDED.reference,
+                creation_datetime = EXCLUDED.creation_datetime,
+                id_table = EXCLUDED.id_table,
+                installation_datetime = EXCLUDED.installation_datetime,
+                departure_datetime = EXCLUDED.departure_datetime
+            RETURNING id
+        """;
+
+        try (Connection conn = new DBConnection().getConnection()) {
+             conn.setAutoCommit(false);
+             Integer orderId;
+             try (PreparedStatement ps = conn.prepareStatement(upsertOrderSql)) {
+                 if (orderToSave.getId() != null) {
+                     ps.setInt(1, orderToSave.getId());
+                 } else {
+                     ps.setInt(1, getNextSerialValue(conn, "\"order\"", "id"));
+                 }
+                 ps.setString(2, orderToSave.getReference());
+                 ps.setTimestamp(3, Timestamp.from(orderToSave.getCreationDatetime()));
+                 ps.setInt(4, orderToSave.getTable().getId());
+                 ps.setTimestamp(5, Timestamp.from(orderToSave.getInstallationDate()));
+                 ps.setTimestamp(6, Timestamp.from(orderToSave.getDepartureDate()));
+
+                 try (ResultSet rs = ps.executeQuery()) {
+                     rs.next();
+                     orderId = rs.getInt(1);
+                 }
+             }
+
+             // Save DishOrders
+             // First delete existing
+             try (PreparedStatement psDelete = conn.prepareStatement("DELETE FROM dish_order WHERE id_order = ?")) {
+                 psDelete.setInt(1, orderId);
+                 psDelete.executeUpdate();
+             }
+
+             // Then insert new
+             if (orderToSave.getDishOrderList() != null && !orderToSave.getDishOrderList().isEmpty()) {
+                 String insertDishOrder = "INSERT INTO dish_order (id, id_order, id_dish, quantity) VALUES (?, ?, ?, ?)";
+                 try (PreparedStatement psDish = conn.prepareStatement(insertDishOrder)) {
+                     for (DishOrder dishOrder : orderToSave.getDishOrderList()) {
+                          psDish.setInt(1, getNextSerialValue(conn, "dish_order", "id"));
+                          psDish.setInt(2, orderId);
+                          psDish.setInt(3, dishOrder.getDish().getId());
+                          psDish.setInt(4, dishOrder.getQuantity());
+                          psDish.addBatch();
+                     }
+                     psDish.executeBatch();
+                 }
+             }
+
+             conn.commit();
+             return findOrderByReference(orderToSave.getReference()); // Re-fetch to return complete object
+        } catch (SQLException e) {
+            throw new RuntimeException(e);
+        }
+    }
+
+    public List<RestaurantTable> findAvailableTables(Instant from, Instant to) {
+        // A table is available if it does NOT have any overlapping order.
+        // Overlap: (StartA <= EndB) and (EndA >= StartB)
+        // So we want tables where NOT EXISTS (conflict)
+
+        String sql = """
+            SELECT t.id, t.number
+            FROM restaurant_table t
+            WHERE NOT EXISTS (
+                SELECT 1 FROM "order" o
+                WHERE o.id_table = t.id
+                AND (o.installation_datetime < ? AND o.departure_datetime > ?)
+            )
+        """;
+        /*
+          Overlap logic corrected:
+          Existing interval: [o.install, o.depart]
+          New interval: [from, to]
+          Overlap if: o.install < to AND o.depart > from
+        */
+
+        DBConnection dbConnection = new DBConnection();
+        try (Connection connection = dbConnection.getConnection()) {
+             PreparedStatement ps = connection.prepareStatement(sql);
+             ps.setTimestamp(1, Timestamp.from(to));
+             ps.setTimestamp(2, Timestamp.from(from));
+
+             List<RestaurantTable> tables = new ArrayList<>();
+             ResultSet rs = ps.executeQuery();
+             while (rs.next()) {
+                 tables.add(new RestaurantTable(rs.getInt("id"), rs.getInt("number")));
+             }
+             return tables;
+        } catch (SQLException e) {
+             throw new RuntimeException(e);
         }
     }
 }

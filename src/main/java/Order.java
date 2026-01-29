@@ -7,6 +7,9 @@ public class Order {
     private String reference;
     private Instant creationDatetime;
     private List<DishOrder> dishOrderList;
+    private RestaurantTable table;
+    private Instant installationDate;
+    private Instant departureDate;
 
     public Integer getId() {
         return id;
@@ -40,13 +43,41 @@ public class Order {
         this.dishOrderList = dishOrderList;
     }
 
+    public RestaurantTable getTable() {
+        return table;
+    }
+
+    public void setTable(RestaurantTable table) {
+        this.table = table;
+    }
+
+    public Instant getInstallationDate() {
+        return installationDate;
+    }
+
+    public void setInstallationDate(Instant installationDate) {
+        this.installationDate = installationDate;
+    }
+
+    public Instant getDepartureDate() {
+        return departureDate;
+    }
+
+    public void setDepartureDate(Instant departureDate) {
+        this.departureDate = departureDate;
+    }
+
     @Override
     public String toString() {
         return "Order{" +
                 "id=" + id +
                 ", reference='" + reference + '\'' +
                 ", creationDatetime=" + creationDatetime +
+                ", creationDatetime=" + creationDatetime +
                 ", dishOrderList=" + dishOrderList +
+                ", table=" + table +
+                ", installationDate=" + installationDate +
+                ", departureDate=" + departureDate +
                 '}';
     }
 
